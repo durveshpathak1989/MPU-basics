@@ -1,0 +1,20 @@
+# MPU Basics - Keywords Reference
+
+# Library name (KEYWORD1)
+MPU	KEYWORD1
+
+# Methods (KEYWORD2)
+initialize	KEYWORD2
+readAccel	KEYWORD2
+readGyro	KEYWORD2
+readTemp	KEYWORD2
+readAll	KEYWORD2
+getAccelX	KEYWORD2
+getAccelY	KEYWORD2
+getAccelZ	KEYWORD2
+getGyroX	KEYWORD2
+getGyroY	KEYWORD2
+getGyroZ	KEYWORD2
+getTemp	KEYWORD2
+
+# Constants (KEYWORD3)
