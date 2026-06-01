@@ -4,6 +4,10 @@
   Demonstrates how to read acceleration, gyroscope, and temperature
   data from an MPU sensor (MPU6050/MPU9250).
   
+  Author: Durvesh Pathak
+  GitHub: https://github.com/durveshpathak1989/MPU-basics
+  License: MIT
+  
   Hardware:
   - Arduino board (Uno, Nano, Mega, etc.)
   - MPU6050 or MPU9250 sensor

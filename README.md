@@ -1,5 +1,9 @@
 # MPU Basics
 
+**Author:** Durvesh Pathak  
+**GitHub:** https://github.com/durveshpathak1989/MPU-basics  
+**License:** MIT
+
 Arduino library for MPU (Motion Processing Unit) sensors like MPU6050 and MPU9250.
 
 ## Features

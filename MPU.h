@@ -1,3 +1,12 @@
+/*
+  MPU.h
+  Arduino library for MPU (Motion Processing Unit) sensors
+  
+  Author: Durvesh Pathak
+  GitHub: https://github.com/durveshpathak1989/MPU-basics
+  License: MIT
+*/
+
 #ifndef MPU_H
 #define MPU_H
 
