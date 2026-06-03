@@ -182,6 +182,15 @@ SharedSensorData g_data;
 SemaphoreHandle_t g_dataMutex = nullptr;
 SemaphoreHandle_t g_spiMutex  = nullptr;
 
+// Avoid pointer-to-member syntax in .ino files. Arduino's prototype generator
+// can choke on syntax like TaskJitterStats SharedSensorData::*field.
+enum JitterTarget : uint8_t {
+    JITTER_IMU = 0,
+    JITTER_BMP,
+    JITTER_RATE,
+    JITTER_TELEMETRY
+};
+
 // ============================================================
 // Task handles
 // ============================================================
@@ -193,10 +202,23 @@ TaskHandle_t taskRateHandle      = nullptr;
 // ============================================================
 // Helper: record jitter safely
 // ============================================================
-void recordSharedJitter(TaskJitterStats SharedSensorData::*field, uint32_t now_us)
+void recordSharedJitter(JitterTarget target, uint32_t now_us)
 {
     if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-        recordJitter(g_data.*field, now_us);
+        switch (target) {
+            case JITTER_IMU:
+                recordJitter(g_data.imuJitter, now_us);
+                break;
+            case JITTER_BMP:
+                recordJitter(g_data.bmpJitter, now_us);
+                break;
+            case JITTER_RATE:
+                recordJitter(g_data.rateJitter, now_us);
+                break;
+            case JITTER_TELEMETRY:
+                recordJitter(g_data.telemetryJitter, now_us);
+                break;
+        }
         xSemaphoreGive(g_dataMutex);
     }
 }
@@ -243,7 +265,7 @@ void taskImu(void* parameter)
 
     while (true) {
         uint32_t startUs = micros();
-        recordSharedJitter(&SharedSensorData::imuJitter, startUs);
+        recordSharedJitter(JITTER_IMU, startUs);
 
         bool ok = false;
         if (xSemaphoreTake(g_spiMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
@@ -271,7 +293,7 @@ void taskBmp(void* parameter)
 
     while (true) {
         uint32_t startUs = micros();
-        recordSharedJitter(&SharedSensorData::bmpJitter, startUs);
+        recordSharedJitter(JITTER_BMP, startUs);
 
         bool ok = false;
         if (xSemaphoreTake(g_spiMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -341,7 +363,7 @@ void taskTelemetry(void* parameter)
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
 
         uint32_t startUs = micros();
-        recordSharedJitter(&SharedSensorData::telemetryJitter, startUs);
+        recordSharedJitter(JITTER_TELEMETRY, startUs);
 
         bool copied = false;
         if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
