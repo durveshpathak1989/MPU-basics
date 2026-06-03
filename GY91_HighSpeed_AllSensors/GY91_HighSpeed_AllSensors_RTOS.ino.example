@@ -14,15 +14,31 @@
     3. Do NOT keep two .ino files with setup()/loop() in the same Arduino sketch folder.
 
   RTOS architecture:
-    Core 1: IMU task      -> reads MPU-9250 accel/gyro/mag as fast as practical
+    Core 1: IMU task      -> reads MPU-9250 accel/gyro/mag at 1 kHz target
     Core 1: BMP task      -> reads BMP280 at 50 Hz
+    Core 0: Rate task     -> calculates read rates and jitter once per second
     Core 0: Telemetry task-> prints sensor snapshot at 10 Hz
+
+  Jitter measurement:
+    Jitter is measured as the difference between the actual task start-to-start
+    interval and the expected interval.
+
+      jitter_us = abs(actual_dt_us - expected_dt_us)
+
+    Printed fields:
+      avgDt = average observed start-to-start period
+      minDt = minimum observed start-to-start period
+      maxDt = maximum observed start-to-start period
+      avgJ  = average absolute jitter
+      maxJ  = maximum absolute jitter
+      n     = number of timing samples in the last 1 second window
 
   Notes:
     - MPU-9250 uses SPI mode 3 inside GY91_MPU9250.cpp.
     - BMP280 uses SPI mode 0 inside GY91_BMP280.cpp.
     - Both devices share SCK/MOSI/MISO but use separate CS pins.
     - A mutex protects shared sensor data between tasks.
+    - A second mutex protects the shared SPI bus between IMU and BMP tasks.
     - Serial printing is intentionally isolated from the IMU task.
   ============================================================
 */
@@ -50,6 +66,95 @@ GY91_MPU9250 imu(PIN_MPU_CS, SPI);
 GY91_BMP280  bmp(PIN_BMP_CS, SPI);
 
 // ============================================================
+// Timing configuration
+// ============================================================
+static const float SEA_LEVEL_HPA = 1013.25f;
+
+static const uint32_t IMU_PERIOD_MS       = 1;     // 1 kHz target
+static const uint32_t BMP_PERIOD_MS       = 20;    // 50 Hz
+static const uint32_t TELEMETRY_PERIOD_MS = 100;   // 10 Hz
+static const uint32_t RATE_PERIOD_MS      = 1000;  // 1 Hz rate/jitter calculation
+
+static const uint32_t IMU_EXPECTED_US       = IMU_PERIOD_MS * 1000UL;
+static const uint32_t BMP_EXPECTED_US       = BMP_PERIOD_MS * 1000UL;
+static const uint32_t TELEMETRY_EXPECTED_US = TELEMETRY_PERIOD_MS * 1000UL;
+static const uint32_t RATE_EXPECTED_US      = RATE_PERIOD_MS * 1000UL;
+
+// ============================================================
+// Jitter statistics
+// ============================================================
+struct TaskJitterStats {
+    uint32_t expected_us;
+    uint32_t last_start_us;
+
+    // Live accumulation window
+    uint32_t samples;
+    uint32_t min_dt_us;
+    uint32_t max_dt_us;
+    uint32_t max_abs_jitter_us;
+    uint64_t sum_dt_us;
+    uint64_t sum_abs_jitter_us;
+
+    // Reported once per second by taskRate
+    uint32_t report_samples;
+    uint32_t report_min_dt_us;
+    uint32_t report_max_dt_us;
+    uint32_t report_max_abs_jitter_us;
+    float report_avg_dt_us;
+    float report_avg_abs_jitter_us;
+};
+
+void resetJitterAccum(TaskJitterStats& s)
+{
+    s.samples = 0;
+    s.min_dt_us = UINT32_MAX;
+    s.max_dt_us = 0;
+    s.max_abs_jitter_us = 0;
+    s.sum_dt_us = 0;
+    s.sum_abs_jitter_us = 0;
+}
+
+void initJitterStats(TaskJitterStats& s, uint32_t expected_us)
+{
+    memset(&s, 0, sizeof(TaskJitterStats));
+    s.expected_us = expected_us;
+    resetJitterAccum(s);
+}
+
+void recordJitter(TaskJitterStats& s, uint32_t now_us)
+{
+    if (s.last_start_us != 0) {
+        uint32_t dt_us = (uint32_t)(now_us - s.last_start_us);
+        uint32_t abs_jitter_us = (dt_us > s.expected_us) ?
+                                 (dt_us - s.expected_us) :
+                                 (s.expected_us - dt_us);
+
+        s.samples++;
+        if (dt_us < s.min_dt_us) s.min_dt_us = dt_us;
+        if (dt_us > s.max_dt_us) s.max_dt_us = dt_us;
+        if (abs_jitter_us > s.max_abs_jitter_us) s.max_abs_jitter_us = abs_jitter_us;
+        s.sum_dt_us += dt_us;
+        s.sum_abs_jitter_us += abs_jitter_us;
+    }
+
+    s.last_start_us = now_us;
+}
+
+void finalizeJitterStats(TaskJitterStats& s)
+{
+    if (s.samples > 0) {
+        s.report_samples = s.samples;
+        s.report_min_dt_us = s.min_dt_us;
+        s.report_max_dt_us = s.max_dt_us;
+        s.report_max_abs_jitter_us = s.max_abs_jitter_us;
+        s.report_avg_dt_us = (float)s.sum_dt_us / (float)s.samples;
+        s.report_avg_abs_jitter_us = (float)s.sum_abs_jitter_us / (float)s.samples;
+    }
+
+    resetJitterAccum(s);
+}
+
+// ============================================================
 // Shared data between tasks
 // ============================================================
 struct SharedSensorData {
@@ -66,19 +171,16 @@ struct SharedSensorData {
 
     bool imuOk;
     bool bmpOk;
+
+    TaskJitterStats imuJitter;
+    TaskJitterStats bmpJitter;
+    TaskJitterStats rateJitter;
+    TaskJitterStats telemetryJitter;
 };
 
 SharedSensorData g_data;
 SemaphoreHandle_t g_dataMutex = nullptr;
-
-// ============================================================
-// Timing configuration
-// ============================================================
-static const float SEA_LEVEL_HPA = 1013.25f;
-
-static const uint32_t BMP_PERIOD_MS       = 20;    // 50 Hz
-static const uint32_t TELEMETRY_PERIOD_MS = 100;   // 10 Hz
-static const uint32_t RATE_PERIOD_MS      = 1000;  // 1 Hz rate calculation
+SemaphoreHandle_t g_spiMutex  = nullptr;
 
 // ============================================================
 // Task handles
@@ -87,6 +189,17 @@ TaskHandle_t taskImuHandle       = nullptr;
 TaskHandle_t taskBmpHandle       = nullptr;
 TaskHandle_t taskTelemetryHandle = nullptr;
 TaskHandle_t taskRateHandle      = nullptr;
+
+// ============================================================
+// Helper: record jitter safely
+// ============================================================
+void recordSharedJitter(TaskJitterStats SharedSensorData::*field, uint32_t now_us)
+{
+    if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        recordJitter(g_data.*field, now_us);
+        xSemaphoreGive(g_dataMutex);
+    }
+}
 
 // ============================================================
 // Helper: copy IMU data into shared state
@@ -121,24 +234,28 @@ void updateSharedBmp(const GY91_BMPData& bmpData)
 // Task 1: IMU task
 // Purpose:
 //   Read MPU-9250 accel/gyro/temp and latest magnetometer value
-//   as fast as practical.
-//
-// Important:
-//   This task does not print. Serial printing would slow down the
-//   high-speed sensor path.
+//   at a 1 kHz target period.
 // ============================================================
 void taskImu(void* parameter)
 {
     GY91_IMUData localImu;
+    TickType_t lastWake = xTaskGetTickCount();
 
     while (true) {
-        if (imu.readAll(localImu)) {
+        uint32_t startUs = micros();
+        recordSharedJitter(&SharedSensorData::imuJitter, startUs);
+
+        bool ok = false;
+        if (xSemaphoreTake(g_spiMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+            ok = imu.readAll(localImu);
+            xSemaphoreGive(g_spiMutex);
+        }
+
+        if (ok) {
             updateSharedImu(localImu);
         }
 
-        // Yield to the scheduler without enforcing a slow fixed delay.
-        // This keeps the IMU path fast while still allowing other tasks to run.
-        taskYIELD();
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(IMU_PERIOD_MS));
     }
 }
 
@@ -146,10 +263,6 @@ void taskImu(void* parameter)
 // Task 2: BMP task
 // Purpose:
 //   Read BMP280 at 50 Hz.
-//
-// Why slower:
-//   Barometer pressure/altitude is not useful at gyro-loop speed.
-//   Keeping it slower prevents it from disturbing the IMU task.
 // ============================================================
 void taskBmp(void* parameter)
 {
@@ -157,7 +270,16 @@ void taskBmp(void* parameter)
     TickType_t lastWake = xTaskGetTickCount();
 
     while (true) {
-        if (bmp.readAll(localBmp, SEA_LEVEL_HPA)) {
+        uint32_t startUs = micros();
+        recordSharedJitter(&SharedSensorData::bmpJitter, startUs);
+
+        bool ok = false;
+        if (xSemaphoreTake(g_spiMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            ok = bmp.readAll(localBmp, SEA_LEVEL_HPA);
+            xSemaphoreGive(g_spiMutex);
+        }
+
+        if (ok) {
             updateSharedBmp(localBmp);
         }
 
@@ -169,7 +291,7 @@ void taskBmp(void* parameter)
 // Task 3: Rate calculation task
 // Purpose:
 //   Calculate actual measured IMU, MAG, and BMP read rates once
-//   per second from counters.
+//   per second from counters. Also finalizes task jitter reports.
 // ============================================================
 void taskRate(void* parameter)
 {
@@ -178,7 +300,11 @@ void taskRate(void* parameter)
     while (true) {
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(RATE_PERIOD_MS));
 
+        uint32_t startUs = micros();
+
         if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            recordJitter(g_data.rateJitter, startUs);
+
             g_data.imuHz = (float)g_data.imuReadCount;
             g_data.bmpHz = (float)g_data.bmpReadCount;
             g_data.magHz = (float)g_data.magNewCount;
@@ -186,6 +312,11 @@ void taskRate(void* parameter)
             g_data.imuReadCount = 0;
             g_data.bmpReadCount = 0;
             g_data.magNewCount = 0;
+
+            finalizeJitterStats(g_data.imuJitter);
+            finalizeJitterStats(g_data.bmpJitter);
+            finalizeJitterStats(g_data.telemetryJitter);
+            finalizeJitterStats(g_data.rateJitter);
 
             xSemaphoreGive(g_dataMutex);
         }
@@ -209,6 +340,9 @@ void taskTelemetry(void* parameter)
     while (true) {
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
 
+        uint32_t startUs = micros();
+        recordSharedJitter(&SharedSensorData::telemetryJitter, startUs);
+
         bool copied = false;
         if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             snapshot = g_data;
@@ -227,8 +361,7 @@ void taskTelemetry(void* parameter)
             "GYRO[dps] %+8.2f %+8.2f %+8.2f | "
             "MAG[uT] %+7.1f %+7.1f %+7.1f valid=%d | "
             "MPU_T=%6.2fC | "
-            "BMP_T=%6.2fC P=%8.2fhPa ALT=%7.2fm | "
-            "Core IMU=%d TEL=%d\n",
+            "BMP_T=%6.2fC P=%8.2fhPa ALT=%7.2fm\n",
 
             snapshot.imuHz,
             snapshot.magHz,
@@ -251,10 +384,40 @@ void taskTelemetry(void* parameter)
 
             snapshot.bmp.temperature_c,
             snapshot.bmp.pressure_hpa,
-            snapshot.bmp.altitude_m,
+            snapshot.bmp.altitude_m
+        );
 
-            xPortGetCoreID(),
-            xPortGetCoreID()
+        Serial.printf(
+            "JIT[us] "
+            "IMU avgDt=%7.1f minDt=%5lu maxDt=%5lu avgJ=%6.1f maxJ=%5lu n=%5lu | "
+            "BMP avgDt=%7.1f minDt=%5lu maxDt=%5lu avgJ=%6.1f maxJ=%5lu n=%4lu | "
+            "TEL avgDt=%7.1f minDt=%5lu maxDt=%5lu avgJ=%6.1f maxJ=%5lu n=%4lu | "
+            "RATE avgDt=%8.1f maxJ=%5lu n=%3lu\n",
+
+            snapshot.imuJitter.report_avg_dt_us,
+            (unsigned long)snapshot.imuJitter.report_min_dt_us,
+            (unsigned long)snapshot.imuJitter.report_max_dt_us,
+            snapshot.imuJitter.report_avg_abs_jitter_us,
+            (unsigned long)snapshot.imuJitter.report_max_abs_jitter_us,
+            (unsigned long)snapshot.imuJitter.report_samples,
+
+            snapshot.bmpJitter.report_avg_dt_us,
+            (unsigned long)snapshot.bmpJitter.report_min_dt_us,
+            (unsigned long)snapshot.bmpJitter.report_max_dt_us,
+            snapshot.bmpJitter.report_avg_abs_jitter_us,
+            (unsigned long)snapshot.bmpJitter.report_max_abs_jitter_us,
+            (unsigned long)snapshot.bmpJitter.report_samples,
+
+            snapshot.telemetryJitter.report_avg_dt_us,
+            (unsigned long)snapshot.telemetryJitter.report_min_dt_us,
+            (unsigned long)snapshot.telemetryJitter.report_max_dt_us,
+            snapshot.telemetryJitter.report_avg_abs_jitter_us,
+            (unsigned long)snapshot.telemetryJitter.report_max_abs_jitter_us,
+            (unsigned long)snapshot.telemetryJitter.report_samples,
+
+            snapshot.rateJitter.report_avg_dt_us,
+            (unsigned long)snapshot.rateJitter.report_max_abs_jitter_us,
+            (unsigned long)snapshot.rateJitter.report_samples
         );
     }
 }
@@ -269,15 +432,25 @@ void setup()
 
     Serial.println();
     Serial.println("==============================================");
-    Serial.println("GY-91 FreeRTOS All Sensor Reader");
+    Serial.println("GY-91 FreeRTOS All Sensor Reader + Jitter Stats");
     Serial.println("Using existing GY91_MPU9250 and GY91_BMP280 libs");
     Serial.println("==============================================");
 
     memset(&g_data, 0, sizeof(g_data));
+    initJitterStats(g_data.imuJitter, IMU_EXPECTED_US);
+    initJitterStats(g_data.bmpJitter, BMP_EXPECTED_US);
+    initJitterStats(g_data.telemetryJitter, TELEMETRY_EXPECTED_US);
+    initJitterStats(g_data.rateJitter, RATE_EXPECTED_US);
 
     g_dataMutex = xSemaphoreCreateMutex();
     if (g_dataMutex == nullptr) {
         Serial.println("[FATAL] Failed to create data mutex.");
+        while (true) delay(1000);
+    }
+
+    g_spiMutex = xSemaphoreCreateMutex();
+    if (g_spiMutex == nullptr) {
+        Serial.println("[FATAL] Failed to create SPI mutex.");
         while (true) delay(1000);
     }
 
@@ -311,40 +484,16 @@ void setup()
     Serial.printf("[OK] BMP280 detected. CHIP_ID=0x%02X\n", bmp.chipID());
 
     // --------------------------------------------------------
-    // Task pinning strategy
+    // Task creation order:
+    //   Create lower-priority tasks first.
+    //   Create IMU last so it does not starve setup() before the
+    //   telemetry/rate tasks are created.
     // --------------------------------------------------------
-    // Core 1: high-speed sensor work
-    // Core 0: telemetry / lower-priority work
-    //
-    // ESP32 Arduino often runs Wi-Fi/Bluetooth/system work heavily on core 0.
-    // Since this sketch has no Wi-Fi, either core would work. Pinning the IMU
-    // to core 1 is still a good habit for future flight-controller work.
-    // --------------------------------------------------------
-
-    xTaskCreatePinnedToCore(
-        taskImu,
-        "taskImu",
-        4096,
-        nullptr,
-        3,
-        &taskImuHandle,
-        1
-    );
-
-    xTaskCreatePinnedToCore(
-        taskBmp,
-        "taskBmp",
-        4096,
-        nullptr,
-        2,
-        &taskBmpHandle,
-        1
-    );
 
     xTaskCreatePinnedToCore(
         taskRate,
         "taskRate",
-        3072,
+        4096,
         nullptr,
         1,
         &taskRateHandle,
@@ -354,11 +503,31 @@ void setup()
     xTaskCreatePinnedToCore(
         taskTelemetry,
         "taskTelemetry",
-        4096,
+        6144,
         nullptr,
         1,
         &taskTelemetryHandle,
         0
+    );
+
+    xTaskCreatePinnedToCore(
+        taskBmp,
+        "taskBmp",
+        4096,
+        nullptr,
+        1,
+        &taskBmpHandle,
+        1
+    );
+
+    xTaskCreatePinnedToCore(
+        taskImu,
+        "taskImu",
+        4096,
+        nullptr,
+        2,
+        &taskImuHandle,
+        1
     );
 
     Serial.println("[BOOT] FreeRTOS tasks started.");
